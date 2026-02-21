@@ -1,9 +1,8 @@
 import express from 'express';
 import cors from 'cors';
 import YahooFinance from 'yahoo-finance2';
-import { db } from './db';
-import { portfolios } from '../shared/schema';
-import { eq } from 'drizzle-orm';
+import { db, portfoliosCollection } from './db';
+import { FieldValue } from 'firebase-admin/firestore';
 
 const yahooFinance = new YahooFinance({ 
   suppressNotices: ['yahooSurvey', 'ripHistorical'] 
@@ -14,6 +13,8 @@ const PORT = 3001;
 
 app.use(cors());
 app.use(express.json());
+
+// ─── Yahoo Finance Routes (unchanged) ──────────────────────────────────────
 
 app.get('/api/historical/:ticker', async (req: express.Request, res: express.Response) => {
   try {
@@ -96,9 +97,18 @@ app.get('/api/search/:query', async (req: express.Request, res: express.Response
   }
 });
 
+// ─── Portfolio CRUD (Firebase Firestore) ────────────────────────────────────
+
 app.get('/api/portfolios', async (req: express.Request, res: express.Response) => {
   try {
-    const allPortfolios = await db.select().from(portfolios).orderBy(portfolios.updatedAt);
+    const snapshot = await portfoliosCollection.orderBy('updatedAt', 'asc').get();
+    const allPortfolios = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+      // Convert Firestore Timestamps to ISO strings for JSON response
+      createdAt: doc.data().createdAt?.toDate?.() ?? doc.data().createdAt,
+      updatedAt: doc.data().updatedAt?.toDate?.() ?? doc.data().updatedAt,
+    }));
     res.json(allPortfolios);
   } catch (error: any) {
     console.error('Error fetching portfolios:', error.message);
@@ -108,12 +118,20 @@ app.get('/api/portfolios', async (req: express.Request, res: express.Response) =
 
 app.get('/api/portfolios/:id', async (req: express.Request, res: express.Response) => {
   try {
-    const id = parseInt(req.params.id);
-    const [portfolio] = await db.select().from(portfolios).where(eq(portfolios.id, id));
-    if (!portfolio) {
+    const { id } = req.params;
+    const doc = await portfoliosCollection.doc(id).get();
+    
+    if (!doc.exists) {
       return res.status(404).json({ error: 'Portfolio not found' });
     }
-    res.json(portfolio);
+    
+    const data = doc.data()!;
+    res.json({
+      id: doc.id,
+      ...data,
+      createdAt: data.createdAt?.toDate?.() ?? data.createdAt,
+      updatedAt: data.updatedAt?.toDate?.() ?? data.updatedAt,
+    });
   } catch (error: any) {
     console.error('Error fetching portfolio:', error.message);
     res.status(500).json({ error: error.message });
@@ -126,11 +144,24 @@ app.post('/api/portfolios', async (req: express.Request, res: express.Response) 
     if (!name || !assets) {
       return res.status(400).json({ error: 'Name and assets are required' });
     }
-    const [newPortfolio] = await db.insert(portfolios).values({
+    
+    const now = new Date();
+    const docRef = await portfoliosCollection.add({
       name,
-      assets
-    }).returning();
-    res.status(201).json(newPortfolio);
+      assets,
+      createdAt: now,
+      updatedAt: now,
+    });
+    
+    const newDoc = await docRef.get();
+    const data = newDoc.data()!;
+    
+    res.status(201).json({
+      id: newDoc.id,
+      ...data,
+      createdAt: data.createdAt?.toDate?.() ?? data.createdAt,
+      updatedAt: data.updatedAt?.toDate?.() ?? data.updatedAt,
+    });
   } catch (error: any) {
     console.error('Error creating portfolio:', error.message);
     res.status(500).json({ error: error.message });
@@ -139,22 +170,32 @@ app.post('/api/portfolios', async (req: express.Request, res: express.Response) 
 
 app.put('/api/portfolios/:id', async (req: express.Request, res: express.Response) => {
   try {
-    const id = parseInt(req.params.id);
+    const { id } = req.params;
     const { name, assets } = req.body;
     
-    const [updated] = await db.update(portfolios)
-      .set({ 
-        name, 
-        assets,
-        updatedAt: new Date()
-      })
-      .where(eq(portfolios.id, id))
-      .returning();
+    const docRef = portfoliosCollection.doc(id);
+    const doc = await docRef.get();
     
-    if (!updated) {
+    if (!doc.exists) {
       return res.status(404).json({ error: 'Portfolio not found' });
     }
-    res.json(updated);
+    
+    const now = new Date();
+    await docRef.update({
+      name,
+      assets,
+      updatedAt: now,
+    });
+    
+    const updated = await docRef.get();
+    const data = updated.data()!;
+    
+    res.json({
+      id: updated.id,
+      ...data,
+      createdAt: data.createdAt?.toDate?.() ?? data.createdAt,
+      updatedAt: data.updatedAt?.toDate?.() ?? data.updatedAt,
+    });
   } catch (error: any) {
     console.error('Error updating portfolio:', error.message);
     res.status(500).json({ error: error.message });
@@ -163,11 +204,15 @@ app.put('/api/portfolios/:id', async (req: express.Request, res: express.Respons
 
 app.delete('/api/portfolios/:id', async (req: express.Request, res: express.Response) => {
   try {
-    const id = parseInt(req.params.id);
-    const [deleted] = await db.delete(portfolios).where(eq(portfolios.id, id)).returning();
-    if (!deleted) {
+    const { id } = req.params;
+    const docRef = portfoliosCollection.doc(id);
+    const doc = await docRef.get();
+    
+    if (!doc.exists) {
       return res.status(404).json({ error: 'Portfolio not found' });
     }
+    
+    await docRef.delete();
     res.json({ success: true });
   } catch (error: any) {
     console.error('Error deleting portfolio:', error.message);
@@ -175,9 +220,13 @@ app.delete('/api/portfolios/:id', async (req: express.Request, res: express.Resp
   }
 });
 
+// ─── Health Check ───────────────────────────────────────────────────────────
+
 app.get('/api/health', (req: express.Request, res: express.Response) => {
   res.json({ status: 'ok' });
 });
+
+// ─── Economic Cycle (unchanged) ────────────────────────────────────────────
 
 type EconomicPhase = 'recovery' | 'expansion' | 'slowdown' | 'recession';
 

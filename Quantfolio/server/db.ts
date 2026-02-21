@@ -1,15 +1,27 @@
-import { Pool, neonConfig } from '@neondatabase/serverless';
-import { drizzle } from 'drizzle-orm/neon-serverless';
-import ws from "ws";
-import * as schema from "../shared/schema";
+import { initializeApp, cert, type ServiceAccount } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
 
-neonConfig.webSocketConstructor = ws;
+// Option 1: Using a service account JSON key (recommended for server-side)
+// Set FIREBASE_SERVICE_ACCOUNT env var to the JSON string of your service account key
+// OR set GOOGLE_APPLICATION_CREDENTIALS env var to the file path of your service account key
 
-if (!process.env.DATABASE_URL) {
+let firebaseConfig: { credential?: ReturnType<typeof cert> } = {};
+
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT) as ServiceAccount;
+  firebaseConfig = { credential: cert(serviceAccount) };
+} else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  // Firebase Admin SDK auto-detects this env var
+  firebaseConfig = {};
+} else {
   throw new Error(
-    "DATABASE_URL must be set. Did you forget to provision a database?",
+    "Firebase credentials not configured. Set either FIREBASE_SERVICE_ACCOUNT (JSON string) " +
+    "or GOOGLE_APPLICATION_CREDENTIALS (file path to service account key)."
   );
 }
 
-export const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-export const db = drizzle({ client: pool, schema });
+const app = initializeApp(firebaseConfig);
+export const db = getFirestore(app);
+
+// Collection reference for portfolios
+export const portfoliosCollection = db.collection('portfolios');

@@ -1,13 +1,6 @@
-import { pgTable, text, serial, integer, jsonb, timestamp } from "drizzle-orm/pg-core";
-import { relations } from "drizzle-orm";
-
-export const portfolios = pgTable("portfolios", {
-  id: serial("id").primaryKey(),
-  name: text("name").notNull(),
-  assets: jsonb("assets").notNull().$type<PortfolioAsset[]>(),
-  createdAt: timestamp("created_at").defaultNow().notNull(),
-  updatedAt: timestamp("updated_at").defaultNow().notNull(),
-});
+// shared/schema.ts
+// Firebase/Firestore version — replaces Drizzle ORM schema
+// Firestore is schemaless, so this defines TypeScript interfaces instead of table definitions.
 
 export interface PortfolioAsset {
   ticker: string;
@@ -18,5 +11,16 @@ export interface PortfolioAsset {
   portfolioId?: number;
 }
 
-export type Portfolio = typeof portfolios.$inferSelect;
-export type InsertPortfolio = typeof portfolios.$inferInsert;
+export interface Portfolio {
+  id: string;              // Firestore document ID (was serial int in Postgres)
+  name: string;
+  assets: PortfolioAsset[];
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// For creating a new portfolio (id and timestamps are auto-generated)
+export type InsertPortfolio = Pick<Portfolio, 'name' | 'assets'>;
+
+// Firestore collection name
+export const PORTFOLIOS_COLLECTION = 'portfolios';
