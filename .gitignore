@@ -26,3 +26,4 @@ dist-ssr
 Quantfolio/.env
 Quantfolio/.env.local
 Quantfolio/node_modules/
+serviceAccountKey.json

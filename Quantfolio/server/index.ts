@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import YahooFinance from 'yahoo-finance2';
@@ -14,13 +15,67 @@ const PORT = 3001;
 app.use(cors());
 app.use(express.json());
 
-// ─── Yahoo Finance Routes (unchanged) ──────────────────────────────────────
+// ─── Rate Limiting & Caching Utilities ─────────────────────────────────────
+
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+interface CacheEntry<T = any> {
+  data: T;
+  timestamp: number;
+}
+
+const cache = new Map<string, CacheEntry>();
+const CACHE_TTL = 5 * 60 * 1000;        // 5 minutes for historical/quote data
+const SEARCH_CACHE_TTL = 10 * 60 * 1000; // 10 minutes for search results
+const REQUEST_DELAY = 350;                // ms between Yahoo Finance calls
+
+let lastRequestTime = 0;
+
+async function rateLimitedDelay(): Promise<void> {
+  const now = Date.now();
+  const elapsed = now - lastRequestTime;
+  if (elapsed < REQUEST_DELAY) {
+    await delay(REQUEST_DELAY - elapsed);
+  }
+  lastRequestTime = Date.now();
+}
+
+function getCached<T>(key: string, ttl: number = CACHE_TTL): T | null {
+  const entry = cache.get(key);
+  if (entry && Date.now() - entry.timestamp < ttl) {
+    return entry.data as T;
+  }
+  if (entry) cache.delete(key); // expired
+  return null;
+}
+
+function setCache<T>(key: string, data: T): void {
+  cache.set(key, { data, timestamp: Date.now() });
+  
+  // Evict old entries if cache gets too large (>500 entries)
+  if (cache.size > 500) {
+    const now = Date.now();
+    for (const [k, v] of cache) {
+      if (now - v.timestamp > CACHE_TTL) cache.delete(k);
+    }
+  }
+}
+
+// ─── Yahoo Finance Routes (with caching & rate limiting) ───────────────────
 
 app.get('/api/historical/:ticker', async (req: express.Request, res: express.Response) => {
   try {
     const { ticker } = req.params;
     const { months = '12', ytd } = req.query;
-    
+    const cacheKey = `historical:${ticker.toUpperCase()}:${months}:${ytd}`;
+
+    // Return cached data if available
+    const cached = getCached(cacheKey);
+    if (cached) {
+      console.log(`[CACHE HIT] historical ${ticker.toUpperCase()}`);
+      return res.json(cached);
+    }
+
     const endDate = new Date();
     let startDate: Date;
     
@@ -30,6 +85,9 @@ app.get('/api/historical/:ticker', async (req: express.Request, res: express.Res
       startDate = new Date();
       startDate.setMonth(startDate.getMonth() - parseInt(months as string));
     }
+
+    // Rate limit before making the request
+    await rateLimitedDelay();
 
     const result = await yahooFinance.chart(ticker.toUpperCase(), {
       period1: startDate.toISOString().split('T')[0],
@@ -48,9 +106,22 @@ app.get('/api/historical/:ticker', async (req: express.Request, res: express.Res
       volume: item.volume
     }));
 
-    res.json({ ticker: ticker.toUpperCase(), data });
+    const response = { ticker: ticker.toUpperCase(), data };
+    setCache(cacheKey, response);
+    res.json(response);
   } catch (error: any) {
     console.error(`Error fetching ${req.params.ticker}:`, error.message);
+    
+    // On rate limit, return cached data even if expired
+    if (error.message?.includes('Too Many Requests')) {
+      const cacheKey = `historical:${req.params.ticker.toUpperCase()}:${req.query.months || '12'}:${req.query.ytd}`;
+      const stale = cache.get(cacheKey);
+      if (stale) {
+        console.log(`[STALE CACHE] Returning expired data for ${req.params.ticker} due to rate limit`);
+        return res.json(stale.data);
+      }
+    }
+    
     res.status(500).json({ error: error.message });
   }
 });
@@ -58,9 +129,19 @@ app.get('/api/historical/:ticker', async (req: express.Request, res: express.Res
 app.get('/api/quote/:ticker', async (req: express.Request, res: express.Response) => {
   try {
     const { ticker } = req.params;
+    const cacheKey = `quote:${ticker.toUpperCase()}`;
+
+    const cached = getCached(cacheKey);
+    if (cached) {
+      console.log(`[CACHE HIT] quote ${ticker.toUpperCase()}`);
+      return res.json(cached);
+    }
+
+    await rateLimitedDelay();
+
     const quote = await yahooFinance.quote(ticker.toUpperCase()) as any;
     
-    res.json({
+    const response = {
       ticker: quote.symbol,
       name: quote.shortName || quote.longName,
       price: quote.regularMarketPrice,
@@ -68,9 +149,21 @@ app.get('/api/quote/:ticker', async (req: express.Request, res: express.Response
       changePercent: quote.regularMarketChangePercent,
       marketCap: quote.marketCap,
       volume: quote.regularMarketVolume
-    });
+    };
+
+    setCache(cacheKey, response);
+    res.json(response);
   } catch (error: any) {
     console.error(`Error fetching quote for ${req.params.ticker}:`, error.message);
+
+    if (error.message?.includes('Too Many Requests')) {
+      const stale = cache.get(`quote:${req.params.ticker.toUpperCase()}`);
+      if (stale) {
+        console.log(`[STALE CACHE] Returning expired quote for ${req.params.ticker} due to rate limit`);
+        return res.json(stale.data);
+      }
+    }
+
     res.status(500).json({ error: error.message });
   }
 });
@@ -78,6 +171,16 @@ app.get('/api/quote/:ticker', async (req: express.Request, res: express.Response
 app.get('/api/search/:query', async (req: express.Request, res: express.Response) => {
   try {
     const { query } = req.params;
+    const cacheKey = `search:${query.toLowerCase()}`;
+
+    const cached = getCached(cacheKey, SEARCH_CACHE_TTL);
+    if (cached) {
+      console.log(`[CACHE HIT] search "${query}"`);
+      return res.json(cached);
+    }
+
+    await rateLimitedDelay();
+
     const results = await yahooFinance.search(query) as any;
     
     const quotes = results.quotes
@@ -90,9 +193,20 @@ app.get('/api/search/:query', async (req: express.Request, res: express.Response
         exchange: q.exchange
       }));
     
-    res.json({ results: quotes });
+    const response = { results: quotes };
+    setCache(cacheKey, response);
+    res.json(response);
   } catch (error: any) {
     console.error(`Error searching for ${req.params.query}:`, error.message);
+
+    if (error.message?.includes('Too Many Requests')) {
+      const stale = cache.get(`search:${req.params.query.toLowerCase()}`);
+      if (stale) {
+        console.log(`[STALE CACHE] Returning expired search for "${req.params.query}" due to rate limit`);
+        return res.json(stale.data);
+      }
+    }
+
     res.status(500).json({ error: error.message });
   }
 });
